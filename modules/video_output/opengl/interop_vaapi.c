@@ -46,6 +46,15 @@ typedef void *GLeglImageOES;
 typedef void (*PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)(GLenum target, GLeglImageOES image);
 #endif
 
+#define DRM_FORMAT_MOD_VENDOR_NONE    0
+#define DRM_FORMAT_RESERVED           ((1ULL << 56) - 1)
+
+#define fourcc_mod_code(vendor, val) \
+        ((((EGLuint64KHR)DRM_FORMAT_MOD_VENDOR_## vendor) << 56) | ((val) & 0x00ffffffffffffffULL))
+
+#define DRM_FORMAT_MOD_INVALID  fourcc_mod_code(NONE, DRM_FORMAT_RESERVED)
+
+
 struct priv
 {
     VADisplay vadpy;
@@ -56,16 +65,17 @@ struct priv
     EGLint drm_fourccs[3];
 
     struct {
-        picture_t *  pic;
-        VAImage      va_image;
-        VABufferInfo va_buffer_info;
-        void *       egl_images[3];
+        picture_t *                 pic;
+        VADRMPRIMESurfaceDescriptor va_surface_descriptor;
+        VAImage                     va_image;
+        void *                      egl_images[3];
     } last;
 };
 
 static EGLImageKHR
 vaegl_image_create(const struct vlc_gl_interop *interop, EGLint w, EGLint h,
-                   EGLint fourcc, EGLint fd, EGLint offset, EGLint pitch)
+                   EGLint fourcc, EGLint fd, EGLint offset, EGLint pitch,
+                   EGLuint64KHR modifier)
 {
     EGLint attribs[] = {
         EGL_WIDTH, w,
@@ -74,6 +84,8 @@ vaegl_image_create(const struct vlc_gl_interop *interop, EGLint w, EGLint h,
         EGL_DMA_BUF_PLANE0_FD_EXT, fd,
         EGL_DMA_BUF_PLANE0_OFFSET_EXT, offset,
         EGL_DMA_BUF_PLANE0_PITCH_EXT, pitch,
+        EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, modifier & 0xffffffff,
+        EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, modifier >> 32,
         EGL_NONE
     };
 
@@ -95,7 +107,8 @@ vaegl_release_last_pic(const struct vlc_gl_interop *interop, struct priv *priv)
     for (unsigned i = 0; i < priv->last.va_image.num_planes; ++i)
         vaegl_image_destroy(interop, priv->last.egl_images[i]);
 
-    vlc_vaapi_ReleaseBufferHandle(o, priv->vadpy, priv->last.va_image.buf);
+    for (unsigned i = 0; i < priv->last.va_surface_descriptor.num_objects; ++i)
+        close(priv->last.va_surface_descriptor.objects[i].fd);
 
     vlc_vaapi_DestroyImage(o, priv->vadpy, priv->last.va_image.image_id);
 
@@ -157,14 +170,14 @@ tc_vaegl_update(const struct vlc_gl_interop *interop, GLuint *textures,
     struct priv *priv = interop->priv;
     vlc_object_t *o = VLC_OBJECT(interop->gl);
     VAImage va_image;
-    VABufferInfo va_buffer_info;
+    VADRMPRIMESurfaceDescriptor va_surface_descriptor;
     EGLImageKHR egl_images[3] = { };
-    bool release_image = false, release_buffer_info = false;
+    bool release_image = false, release_prime = false;
 
     if (pic == priv->last.pic)
     {
         va_image = priv->last.va_image;
-        va_buffer_info = priv->last.va_buffer_info;
+        va_surface_descriptor = priv->last.va_surface_descriptor;
         for (unsigned i = 0; i < priv->last.va_image.num_planes; ++i)
             egl_images[i] = priv->last.egl_images[i];
     }
@@ -177,21 +190,30 @@ tc_vaegl_update(const struct vlc_gl_interop *interop, GLuint *textures,
 
         assert(va_image.format.fourcc == priv->fourcc);
 
-        va_buffer_info = (VABufferInfo) {
-            .mem_type = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME
-        };
-        if (vlc_vaapi_AcquireBufferHandle(o, priv->vadpy, va_image.buf,
-                                          &va_buffer_info))
+        if (vlc_vaapi_ExportSurfaceHandle(o, priv->vadpy, vlc_vaapi_PicGetSurface(pic),
+                                          VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2, 0,
+                                          &va_surface_descriptor))
             goto error;
-        release_buffer_info = true;
+        release_prime = true;
     }
 
-    for (unsigned i = 0; i < va_image.num_planes; ++i)
+    for (unsigned i = 0; i < va_surface_descriptor.num_layers; ++i)
     {
+        unsigned obj_idx = va_surface_descriptor.layers[i].object_index[0];
+
+        /* Since we don't ask for composite object through
+         * vaExportSurfaceHandle, we shouldn't get any multiplane
+         * layer. */
+        if (va_surface_descriptor.layers[i].num_planes > 1)
+          goto error;
+
         egl_images[i] =
             vaegl_image_create(interop, tex_width[i], tex_height[i],
-                               priv->drm_fourccs[i], va_buffer_info.handle,
-                               va_image.offsets[i], va_image.pitches[i]);
+                               priv->drm_fourccs[i],
+                               va_surface_descriptor.objects[obj_idx].fd,
+                               va_surface_descriptor.layers[i].offset[0],
+                               va_surface_descriptor.layers[i].pitch[0],
+                               va_surface_descriptor.objects[obj_idx].drm_format_modifier);
         if (egl_images[i] == NULL)
             goto error;
 
@@ -206,7 +228,8 @@ tc_vaegl_update(const struct vlc_gl_interop *interop, GLuint *textures,
             vaegl_release_last_pic(interop, priv);
         priv->last.pic = picture_Hold(pic);
         priv->last.va_image = va_image;
-        priv->last.va_buffer_info = va_buffer_info;
+        priv->last.va_surface_descriptor = va_surface_descriptor;
+
         for (unsigned i = 0; i < va_image.num_planes; ++i)
             priv->last.egl_images[i] = egl_images[i];
     }
@@ -216,8 +239,11 @@ tc_vaegl_update(const struct vlc_gl_interop *interop, GLuint *textures,
 error:
     if (release_image)
     {
-        if (release_buffer_info)
-            vlc_vaapi_ReleaseBufferHandle(o, priv->vadpy, va_image.buf);
+        if (release_prime)
+        {
+            for (unsigned i = 0; i < va_surface_descriptor.num_objects; ++i)
+                close(va_surface_descriptor.objects[i].fd);
+        }
 
         for (unsigned i = 0; i < 3 && egl_images[i] != NULL; ++i)
             vaegl_image_destroy(interop, egl_images[i]);
@@ -313,7 +339,7 @@ tc_va_check_derive_image(const struct vlc_gl_interop *interop)
         EGLint h = (va_image.height * image_desc->p[i].h.num) / image_desc->p[i].h.den;
         EGLImageKHR egl_image =
             vaegl_image_create(interop, w, h, priv->drm_fourccs[i], va_buffer_info.handle,
-                               va_image.offsets[i], va_image.pitches[i]);
+                               va_image.offsets[i], va_image.pitches[i], DRM_FORMAT_MOD_INVALID);
         if (egl_image == NULL)
         {
             msg_Warn(o, "Can't create Image KHR: kernel too old ?");

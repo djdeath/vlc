@@ -589,3 +589,16 @@ vlc_vaapi_PicGetDisplay(picture_t *pic)
     struct vaapi_pic_context *pic_ctx = (struct vaapi_pic_context *)pic->context;
     return pic_ctx->va_dpy;
 }
+
+int
+vlc_vaapi_ExportSurfaceHandle(vlc_object_t *o,
+                              VADisplay dpy,
+                              VASurfaceID surface,
+                              uint32_t mem_type,
+                              uint32_t flags,
+                              void *descriptor)
+{
+    VA_CALL(o, vaExportSurfaceHandle, dpy, surface, mem_type, flags, descriptor);
+    return VLC_SUCCESS;
+error: return VLC_EGENERIC;
+}
